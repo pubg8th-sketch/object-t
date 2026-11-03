@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>실시간 객체 추적 & 자동 줌 방송 카메라</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0f172a;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 1rem;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+    h1 { font-size: 1.5rem; color: #38bdf8; margin-bottom: 0.25rem; }
+    p { font-size: 0.875rem; color: #94a3b8; }
+    
+    .main-container {
+      position: relative;
+      width: 100%;
+      max-width: 960px;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+
+    /* 원본 웹캠 스크림 (숨김 처리 후 Canvas로 처리) */
+    #webcam { display: none; }
+
+    /* 최종 중계 캔버스 */
+    #outputCanvas {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      cursor: crosshair;
+    }
+
+    /* 컨트롤 및 상태 UI */
+    .controls {
+      margin-top: 1rem;
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      background: #0284c7;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #0369a1; }
+    .status-badge {
+      font-size: 0.85rem;
+      padding: 0.4rem 0.8rem;
+      border-radius: 20px;
+      background: #334155;
+      color: #cbd5e1;
+    }
+    .status-badge.active {
+      background: #0369a1;
+      color: #38bdf8;
+    }
+  </style>
+
+  <!-- MediaPipe Tasks Vision (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <header>
+    <h1>🎯 실시간 자동 줌인 방송 중계 카메라</h1>
+    <p>화면에서 추적할 대상을 드래그하여 지정하세요. (경로 예측 없이 지정 객체를 즉시 추적합니다)</p>
+  </header>
+
+  <div class="main-container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="outputCanvas"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="resetBtn">추적 초기화</button>
+    <div id="status" class="status-badge">카메라 및 모델 로딩 중...</div>
+  </div>
+
+  <script type="module">
+    import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("outputCanvas");
+    const ctx = canvas.getContext("2d");
+    const resetBtn = document.getElementById("resetBtn");
+    const statusEl = document.getElementById("status");
+
+    let objectDetector;
+    let isVideoReady = false;
+    let selectedTargetBox = null; // { x, y, width, height } - 비율 좌표 (0.0 ~ 1.0)
+    let currentViewport = null;   // 보간 적용용 줌 뷰포트
+    
+    // 드래그 선택 관련 변수
+    let isDragging = false;
+    let dragStart = { x: 0, y: 0 };
+    let dragEnd = { x: 0, y: 0 };
+
+    // 1. 최고 해상도로 웹캠 초기화 및 객체 탐지 모델 로드
+    async function init() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        objectDetector = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+            delegate: "GPU"
+          },
+          scoreThreshold: 0.3,
+          runningMode: "VIDEO"
+        });
+
+        // 사용 가능한 최대 해상도 요청 (4K/FHD)
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 3840, min: 1920 },
+            height: { ideal: 2160, min: 1080 },
+            frameRate: { ideal: 60 }
+          }
+        });
+
+        video.srcObject = stream;
+        video.addEventListener("loadedmetadata", () => {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          isVideoReady = true;
+          statusEl.textContent = `준비 완료 (${video.videoWidth}x${video.videoHeight}) - 화면을 드래그하세요`;
+          statusEl.classList.add("active");
+          requestAnimationFrame(processFrame);
+        });
+      } catch (err) {
+        statusEl.textContent = "에러: 카메라 또는 모델을 로드할 수 없습니다.";
+        console.error(err);
+      }
+    }
+
+    // 2. 실시간 프레임 처리 루프 (경로 예측 없이 현재 프레임 바운딩 박스 매칭만 수행)
+    let lastVideoTime = -1;
+    function processFrame() {
+      if (isVideoReady && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        
+        const detections = objectDetector.detectForVideo(video, performance.now()).detections;
+
+        if (selectedTargetBox) {
+          // 예측 알고리즘 제외: 단순 겹침(IoU) 기반으로 현재 프레임에서 가장 근접한 객체 위치 업데이트
+          const matched = findBestMatch(selectedTargetBox, detections);
+          if (matched) {
+            selectedTargetBox = matched;
+          }
+        }
+
+        renderBroadcastView();
+      }
+      requestAnimationFrame(processFrame);
+    }
+
+    // 지정 박스와 가장 겹치는 영역을 찾아 선택된 위치 갱신
+    function findBestMatch(target, detections) {
+      let maxOverlap = 0;
+      let bestBox = null;
+
+      for (const det of detections) {
+        const bb = det.boundingBox;
+        // 픽셀 좌표를 0~1 비율 좌표로 전환
+        const box = {
+          x: bb.originX / canvas.width,
+          y: bb.originY / canvas.height,
+          w: bb.width / canvas.width,
+          h: bb.height / canvas.height
+        };
+
+        const overlap = calculateOverlap(target, box);
+        if (overlap > maxOverlap && overlap > 0.15) {
+          maxOverlap = overlap;
+          bestBox = box;
+        }
+      }
+      return bestBox || target; // 감지 실패 시 기존 사각 영역 유지
+    }
+
+    function calculateOverlap(a, b) {
+      const xA = Math.max(a.x, b.x);
+      const yA = Math.max(a.y, b.y);
+      const xB = Math.min(a.x + a.w, b.x + b.w);
+      const yB = Math.min(a.y + a.h, b.y + b.h);
+
+      const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
+      if (interArea === 0) return 0;
+
+      const aArea = a.w * a.h;
+      const bArea = b.w * b.h;
+      return interArea / (aArea + bArea - interArea);
+    }
+
+    // 3. 방송 중계용 줌인 및 클로즈업 렌더링
+    function renderBroadcastView() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!selectedTargetBox) {
+        // 지정된 대상이 없을 때는 전체 화면 출력
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      } else {
+        // 객체 중심점 계산
+        const targetCenterX = (selectedTargetBox.x + selectedTargetBox.w / 2) * canvas.width;
+        const targetCenterY = (selectedTargetBox.y + selectedTargetBox.h / 2) * canvas.height;
+        const targetW = selectedTargetBox.w * canvas.width;
+        const targetH = selectedTargetBox.h * canvas.height;
+
+        // 마진 확보 및 타겟 크기 기반 줌 배율 결정
+        const paddingMultiplier = 2.2;
+        let cropW = Math.max(targetW * paddingMultiplier, 320); // 최소 줌 한계
+        let cropH = cropW * (canvas.height / canvas.width);    // 16:9 비율 유지
+
+        if (cropH < targetH * paddingMultiplier) {
+          cropH = targetH * paddingMultiplier;
+          cropW = cropH * (canvas.width / canvas.height);
+        }
+
+        // 화면 영역 이탈 방지 clamping
+        let cropX = Math.max(0, Math.min(canvas.width - cropW, targetCenterX - cropW / 2));
+        let cropY = Math.max(0, Math.min(canvas.height - cropH, targetCenterY - cropH / 2));
+
+        // 부드러운 방송용 카메라 이동을 위한 Lerp 보간
+        if (!currentViewport) {
+          currentViewport = { x: cropX, y: cropY, w: cropW, h: cropH };
+        } else {
+          const lerpFactor = 0.12; // 카메라 추적 반응 속도
+          currentViewport.x += (cropX - currentViewport.x) * lerpFactor;
+          currentViewport.y += (cropY - currentViewport.y) * lerpFactor;
+          currentViewport.w += (cropW - currentViewport.w) * lerpFactor;
+          currentViewport.h += (cropH - currentViewport.h) * lerpFactor;
+        }
+
+        // 선택 영역 크롭 후 Canvas에 크기 맞춰 자르기(Zoom-in)
+        ctx.drawImage(
+          video,
+          currentViewport.x, currentViewport.y, currentViewport.w, currentViewport.h,
+          0, 0, canvas.width, canvas.height
+        );
+
+        // 추적 대상 식별용 디스플레이 박스 시각화
+        drawTargetUI(currentViewport);
+      }
+
+      // 드래그 선택 중인 사각형 표시
+      if (isDragging) {
+        const rectX = Math.min(dragStart.x, dragEnd.x);
+        const rectY = Math.min(dragStart.y, dragEnd.y);
+        const rectW = Math.abs(dragEnd.x - dragStart.x);
+        const rectH = Math.abs(dragEnd.y - dragStart.y);
+
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([6, 6]);
+        ctx.strokeRect(rectX, rectY, rectW, rectH);
+        ctx.setLineDash([]);
+      }
+    }
+
+    function drawTargetUI(vp) {
+      // 바운딩 박스를 현재 줌 뷰포트에 대응시켜 그리기
+      const relX = ((selectedTargetBox.x * canvas.width) - vp.x) * (canvas.width / vp.w);
+      const relY = ((selectedTargetBox.y * canvas.height) - vp.y) * (canvas.height / vp.h);
+      const relW = (selectedTargetBox.w * canvas.width) * (canvas.width / vp.w);
+      const relH = (selectedTargetBox.h * canvas.height) * (canvas.height / vp.h);
+
+      ctx.strokeStyle = "#ef4444";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(relX, relY, relW, relH);
+
+      // LIVE 방송 라이트 뱃지 표시
+      ctx.fillStyle = "#ef4444";
+      ctx.fillRect(relX, relY - 26, 70, 22);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 12px sans-serif";
+      ctx.fillText("LIVE TRACK", relX + 6, relY - 11);
+    }
+
+    // 4. 드래그 이벤트 (사용자 직접 터치/클릭 선택)
+    function getCanvasCoordinates(e) {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+      return {
+        x: (clientX - rect.left) * scaleX,
+        y: (clientY - rect.top) * scaleY
+      };
+    }
+
+    function handleStart(e) {
+      isDragging = true;
+      dragStart = getCanvasCoordinates(e);
+      dragEnd = dragStart;
+    }
+
+    function handleMove(e) {
+      if (!isDragging) return;
+      dragEnd = getCanvasCoordinates(e);
+    }
+
+    function handleEnd() {
+      if (!isDragging) return;
+      isDragging = false;
+
+      const rectX = Math.min(dragStart.x, dragEnd.x);
+      const rectY = Math.min(dragStart.y, dragEnd.y);
+      const rectW = Math.abs(dragEnd.x - dragStart.x);
+      const rectH = Math.abs(dragEnd.y - dragStart.y);
+
+      // 너무 작은 클릭 오류 방지 (최소 20px 이상 지정 시 적용)
+      if (rectW > 20 && rectH > 20) {
+        // 드래그한 영역을 현재 크롭 뷰포트 좌표에서 원본 프레임 좌표 비율로 역산
+        if (selectedTargetBox && currentViewport) {
+          const normX = (currentViewport.x + (rectX / canvas.width) * currentViewport.w) / canvas.width;
+          const normY = (currentViewport.y + (rectY / canvas.height) * currentViewport.h) / canvas.height;
+          const normW = (rectW / canvas.width * currentViewport.w) / canvas.width;
+          const normH = (rectH / canvas.height * currentViewport.h) / canvas.height;
+
+          selectedTargetBox = { x: normX, y: normY, w: normW, h: normH };
+        } else {
+          selectedTargetBox = {
+            x: rectX / canvas.width,
+            y: rectY / canvas.height,
+            w: rectW / canvas.width,
+            h: rectH / canvas.height
+          };
+        }
+        currentViewport = null; // 새로운 타겟 기준으로 카메라 재설정
+      }
+    }
+
+    // 마우스 및 터치 이벤트 연결
+    canvas.addEventListener("mousedown", handleStart);
+    canvas.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleEnd);
+
+    canvas.addEventListener("touchstart", handleStart, { passive: true });
+    canvas.addEventListener("touchmove", handleMove, { passive: true });
+    window.addEventListener("touchend", handleEnd);
+
+    resetBtn.addEventListener("click", () => {
+      selectedTargetBox = null;
+      currentViewport = null;
+      statusEl.textContent = "추적이 초기화되었습니다. 화면을 드래그하세요.";
+    });
+
+    window.onload = init;
+  </script>
+</body>
+</html>
